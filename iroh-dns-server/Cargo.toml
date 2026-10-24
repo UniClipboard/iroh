@@ -65,7 +65,7 @@ iroh = { path = "../iroh" }
 n0-error = { version = "1.0.0", features = ["anyhow"] }
 n0-tracing-test = "0.3"
 rand = "0.10"
-simple-dns = "0.12"
+simple-dns = { version = "0.12", git = "https://github.com/UniClipboard/simple-dns.git", rev = "f0a90faa192aef10a9258dbc93a21670d2b3a4d3" }
 rand_chacha = "0.10"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider", "http2", "json"
