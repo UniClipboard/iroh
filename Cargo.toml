@@ -1,5 +1,8 @@
 [workspace]
 members = [
+  "iroh-blobs",
+  "iroh-tickets",
+  "iroh-util",
   "iroh-base",
   "iroh-dns",
   "iroh-dns-server",
