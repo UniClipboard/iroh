@@ -20,14 +20,14 @@ n0-error = "1.0.0"
 n0-future = "0.3"
 portable-atomic = "1"
 rand = "0.10"
-simple-dns = { version = "0.12", git = "https://github.com/UniClipboard/simple-dns.git", rev = "f0a90faa192aef10a9258dbc93a21670d2b3a4d3" }
+simple-dns = { version = "0.12", git = "https://github.com/UniClipboard/simple-dns.git", rev = "db89dd28485e890cc195ed8b1b1f6a78c5974a8e" }
 strum = { version = "0.28", features = ["derive"] }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 url = "2.5.3"
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-n0-dns-resolver = { version = "0.1", git = "https://github.com/UniClipboard/n0-dns-resolver.git", rev = "dbe78c23aecc9669d06c93f17693d6ad50a2cac5", default-features = false, features = ["transport-tls", "transport-https"] }
+n0-dns-resolver = { version = "0.1", git = "https://github.com/UniClipboard/n0-dns-resolver.git", rev = "53143c9e3ad82f455cab13cb7496adfbcce785f1", default-features = false, features = ["transport-tls", "transport-https"] }
 rustls = { version = "0.23.33", default-features = false }
 
 [build-dependencies]
