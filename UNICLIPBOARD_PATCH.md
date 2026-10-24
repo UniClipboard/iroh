@@ -10,7 +10,9 @@
 
 新增源码快照保留原许可证、测试与来源说明，仅修改依赖清单：
 - iroh-blobs 0.103.0：UniClipboard/iroh-blobs `152c42a9217f1377a998b271e0052311e8ada789`，保留其 UNICLIPBOARD_PATCH.md 的四项修复。
-- iroh-tickets 1.0.0：crates.io 发布源码。
-- iroh-util 0.6.0：crates.io 发布源码。
+- iroh-tickets 1.0.0：crates.io 发布源码，归档 SHA-256 `da53233419ca36bf521ed45683b7748366f9b233032891eefc2d70567a84ac54`。
+- iroh-util 0.6.0：crates.io 发布源码，归档 SHA-256 `20e41eb982f15230c55f0a70a74a514360e1f565b07861924fd0e8db172b3d00`。
 
 退出条件：上游发布包含路径队列、EDNS 与 blobs 修复的完整兼容依赖链；整体升级并验证无根补丁下游消费者后移除对应维护补丁。
+
+Engine 的路径依赖格式检查覆盖 blobs，因此同步格式化 Downloader 初始化表达式；无行为或 iroh 调用点变化。

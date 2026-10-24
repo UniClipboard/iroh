@@ -396,7 +396,10 @@ impl Downloader {
         let (tx, rx) = tokio::sync::mpsc::channel::<SwarmMsg>(32);
         let actor = DownloaderActor::new_with_pool(store.clone(), pool.clone());
         n0_future::task::spawn(actor.run(rx));
-        Self { client: tx.into(), pool }
+        Self {
+            client: tx.into(),
+            pool,
+        }
     }
 
     pub async fn shutdown_endpoint(
