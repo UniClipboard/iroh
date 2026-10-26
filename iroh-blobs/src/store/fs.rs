@@ -138,6 +138,8 @@ mod delete_set;
 mod entry_state;
 mod import;
 mod lifecycle;
+#[cfg(test)]
+mod persistence_tests;
 mod meta;
 pub mod options;
 pub(crate) mod util;
@@ -1596,7 +1598,7 @@ pub mod tests {
         round_up_to_chunks_groups(ranges, IROH_BLOCK_SIZE)
     }
 
-    fn create_n0_bao_full(
+    pub(super) fn create_n0_bao_full(
         data: &[u8],
         ranges: &ChunkRanges,
     ) -> n0_error::Result<(Hash, ChunkRanges, Vec<u8>)> {
