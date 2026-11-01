@@ -986,6 +986,13 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.close(error_code, reason)
     }
 
+    /// 原子检查并关闭连接；只有本次调用赢得原生关闭时返回 true。
+    /// 已关闭时不改写原因；返回值不能替代对实际错误来源的核对。
+    #[inline]
+    pub fn close_if_open(&self, error_code: VarInt, reason: &[u8]) -> bool {
+        self.inner.close_if_open(error_code, reason)
+    }
+
     /// Transmits `data` as an unreliable, unordered application datagram.
     ///
     /// Application datagrams are a low-level primitive. They may be lost or delivered out
