@@ -1,6 +1,6 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
-use iroh_base::EndpointAddr;
+use iroh_base::{EndpointAddr, TransportAddr};
 
 use crate::endpoint::{connection::Connection, quic::VarInt};
 
@@ -66,6 +66,23 @@ impl AfterHandshakeOutcome {
 /// [`Endpoint`]: crate::Endpoint
 /// [`Builder::hooks`]: crate::endpoint::Builder::hooks
 pub trait EndpointHooks: std::fmt::Debug + Send + Sync {
+    /// 在传输重新绑定和 QUIC 通知之前观察本机网络变化。
+    ///
+    /// 现有网络监视器报告的重大变化和次要变化均触发此回调，包括接口前缀变化。
+    /// 此回调不在发送轮询中运行。
+    /// 实现必须快速返回，并将所有 I/O 安排在此回调之外。
+    fn on_network_change(&self) {}
+
+    /// 判断是否允许向此传输地址发送对端数据报。
+    ///
+    /// 发送者在解析映射地址后调用此方法，覆盖初始候选、认证后的 NAT 穿透探测和入站学到的路径。
+    /// 返回 false 会静默丢弃数据报，不会使 endpoint 失败。
+    /// 此方法不筛选发现流量、relay 建立流量或其他控制流量。
+    /// 实现必须快速返回，且不得持有 endpoint。
+    fn allow_transport_send(&self, _remote: &TransportAddr) -> bool {
+        true
+    }
+
     /// Intercept outgoing connections before they are started.
     ///
     /// This is called whenever a new outgoing connection is initiated via [`Endpoint::connect`]
@@ -108,6 +125,8 @@ pub trait EndpointHooks: std::fmt::Debug + Send + Sync {
 }
 
 pub(crate) trait DynEndpointHooks: std::fmt::Debug + Send + Sync {
+    fn on_network_change(&self);
+    fn allow_transport_send(&self, remote: &TransportAddr) -> bool;
     fn before_connect<'a>(
         &'a self,
         remote_addr: &'a EndpointAddr,
@@ -117,6 +136,14 @@ pub(crate) trait DynEndpointHooks: std::fmt::Debug + Send + Sync {
 }
 
 impl<T: EndpointHooks> DynEndpointHooks for T {
+    fn on_network_change(&self) {
+        EndpointHooks::on_network_change(self)
+    }
+
+    fn allow_transport_send(&self, remote: &TransportAddr) -> bool {
+        EndpointHooks::allow_transport_send(self, remote)
+    }
+
     fn before_connect<'a>(
         &'a self,
         remote_addr: &'a EndpointAddr,
@@ -130,14 +157,26 @@ impl<T: EndpointHooks> DynEndpointHooks for T {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct EndpointHooksList {
-    inner: Vec<Box<dyn DynEndpointHooks>>,
+    inner: Vec<Arc<dyn DynEndpointHooks>>,
 }
 
 impl EndpointHooksList {
+    pub(crate) fn on_network_change(&self) {
+        for hook in &self.inner {
+            hook.on_network_change();
+        }
+    }
+
+    pub(crate) fn allow_transport_send(&self, remote: &TransportAddr) -> bool {
+        self.inner
+            .iter()
+            .all(|hook| hook.allow_transport_send(remote))
+    }
+
     pub(super) fn push(&mut self, hook: impl EndpointHooks + 'static) {
-        let hook: Box<dyn DynEndpointHooks> = Box::new(hook);
+        let hook: Arc<dyn DynEndpointHooks> = Arc::new(hook);
         self.inner.push(hook);
     }
 

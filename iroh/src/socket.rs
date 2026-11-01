@@ -1655,6 +1655,7 @@ impl Actor {
     /// This is triggered when the netmon actor detects a change in the local network
     /// interfaces, assigned IP addresses and routes.
     fn handle_network_change(&mut self, is_major: bool) {
+        self.sock.hooks.on_network_change();
         debug!(is_major, "link change detected");
 
         if is_major {
@@ -1668,6 +1669,14 @@ impl Actor {
             self.re_stun(UpdateReason::LinkChangeMajor);
         } else {
             self.re_stun(UpdateReason::LinkChangeMinor);
+        }
+
+        // 本机接口和绑定端口已知，不等待外部网络报告完成才发布本地候选。
+        // LAN-only 连续同类变化会写入相同报告值，报告 watcher 不会再次通知。
+        #[cfg(not(wasm_browser))]
+        {
+            let (report, _reason) = self.sock.net_report.get();
+            self.update_direct_addresses(report.as_ref());
         }
 
         if self.has_usable_network() {

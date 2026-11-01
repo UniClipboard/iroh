@@ -18,7 +18,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 use super::{Socket, mapped_addrs::MultipathMappedAddr};
 use crate::{
-    endpoint::RelayStatus,
+    endpoint::{RelayStatus, hooks::EndpointHooksList},
     metrics::EndpointMetrics,
     net_report::Report,
     socket::mapped_addrs::{AddrMap, CustomMappedAddr},
@@ -476,6 +476,7 @@ impl Transports {
             relay,
             custom,
             max_transmit_segments,
+            hooks: EndpointHooksList::default(),
         }
     }
 
@@ -958,6 +959,7 @@ pub(crate) struct TransportsSender {
     relay: Vec<RelaySender>,
     custom: Vec<Arc<dyn CustomSender>>,
     max_transmit_segments: NonZeroUsize,
+    hooks: EndpointHooksList,
 }
 
 impl TransportsSender {
@@ -968,6 +970,12 @@ impl TransportsSender {
         network_path: &FourTuple,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
+        if !self
+            .hooks
+            .allow_transport_send(&network_path.remote().into())
+        {
+            return Poll::Ready(Ok(()));
+        }
         match network_path {
             #[cfg(wasm_browser)]
             FourTuple::Ip { .. } => {
@@ -1062,9 +1070,11 @@ impl Transport {
 
 impl noq::AsyncUdpSocket for Transport {
     fn create_sender(&self) -> Pin<Box<dyn noq::UdpSender>> {
+        let mut sender = self.transports.create_sender();
+        sender.hooks = self.sock.hooks.clone();
         Box::pin(Sender {
             sock: self.sock.clone(),
-            sender: self.transports.create_sender(),
+            sender,
         })
     }
 
@@ -1333,6 +1343,7 @@ mod tests {
                 relay: vec![sender],
                 custom: Vec::new(),
                 max_transmit_segments: NonZeroUsize::new(1).unwrap(),
+                hooks: EndpointHooksList::default(),
             };
             (
                 sender,
