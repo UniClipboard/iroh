@@ -35,3 +35,9 @@ The socket actor refreshes native direct candidates after both major and minor i
 The remote actor re-runs the existing path selector after retiring one connection while others remain. Mixed QUIC Initial sends retain the selected remote first and also use known alternative candidates. Existing send-task limits, concurrent fanout, timeouts and final transport policy still apply. Established packet selection is unchanged.
 
 Iroh uses the netwatch0.19.3 source in `netwatch/` through a path dependency. Its maintenance note records exact upstream provenance, licenses and the complete-state/Linux-prefix notification correction. No root Cargo patch table or additional network monitor is required.
+
+## Return-path permission before QUIC receive admission
+
+`Socket::process_datagrams` also applies the existing transport permission predicate to the real remote source before mapping and Noq consumption. A path whose response is forbidden must not allocate pending QUIC handshake state before an allowed alternative copy of the same Initial arrives. Noq indexes these Initial copies by destination CID and does not permit a server to migrate that handshake before confirmation. Rejected receive slots have zero length; adjacent slots and GRO metadata keep their existing ownership.
+
+This uses the current egress classification, not identity or reachability inference. The final send check remains authoritative. The hook must be a repeatable, side-effect-free permission predicate because both receive and send paths invoke it. Its default remains allow. This does not evict existing connections, relax QUIC authentication, classify discovery/control traffic, add retry work or provide an instantaneous packet barrier. Remove this correction with an equivalent upstream policy boundary only after the asymmetric subnet-revocation E2E and default-P2P/transport regressions pass.

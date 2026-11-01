@@ -77,8 +77,9 @@ pub trait EndpointHooks: std::fmt::Debug + Send + Sync {
     ///
     /// 发送者在解析映射地址后调用此方法，覆盖初始候选、认证后的 NAT 穿透探测和入站学到的路径。
     /// 返回 false 会静默丢弃数据报，不会使 endpoint 失败。
+    /// 接收归一化也复用此判断，避免无法回包的路径先占用 QUIC 握手状态。
     /// 此方法不筛选发现流量、relay 建立流量或其他控制流量。
-    /// 实现必须快速返回，且不得持有 endpoint。
+    /// 实现必须是可重复调用的纯许可判断，必须快速返回，且不得持有 endpoint。
     fn allow_transport_send(&self, _remote: &TransportAddr) -> bool {
         true
     }

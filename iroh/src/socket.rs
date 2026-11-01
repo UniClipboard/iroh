@@ -623,6 +623,12 @@ impl Socket {
             } else {
                 trace!(src = ?remote_addr, len = noq_meta.len, "datagram received");
             }
+            // 无法回包的路径不能先占用 QUIC 握手：同一 Initial CID 的可用候选
+            // 会被归入该握手，而服务端在握手完成前不能切换远端路径。
+            if !self.hooks.allow_transport_send(&remote_addr.clone().into()) {
+                noq_meta.len = 0;
+                continue;
+            }
             match remote_addr {
                 transports::Addr::Ip(SocketAddr::V4(..)) => {
                     self.metrics.socket.recv_data_ipv4.inc_by(noq_meta.len as _);
