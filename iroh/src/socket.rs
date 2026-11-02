@@ -623,6 +623,12 @@ impl Socket {
             } else {
                 trace!(src = ?remote_addr, len = noq_meta.len, "datagram received");
             }
+            // 无法回包的路径不能先占用 QUIC 握手：同一 Initial CID 的可用候选
+            // 会被归入该握手，而服务端在握手完成前不能切换远端路径。
+            if !self.hooks.allow_transport_send(&remote_addr.clone().into()) {
+                noq_meta.len = 0;
+                continue;
+            }
             match remote_addr {
                 transports::Addr::Ip(SocketAddr::V4(..)) => {
                     self.metrics.socket.recv_data_ipv4.inc_by(noq_meta.len as _);
@@ -1655,6 +1661,7 @@ impl Actor {
     /// This is triggered when the netmon actor detects a change in the local network
     /// interfaces, assigned IP addresses and routes.
     fn handle_network_change(&mut self, is_major: bool) {
+        self.sock.hooks.on_network_change();
         debug!(is_major, "link change detected");
 
         if is_major {
@@ -1668,6 +1675,14 @@ impl Actor {
             self.re_stun(UpdateReason::LinkChangeMajor);
         } else {
             self.re_stun(UpdateReason::LinkChangeMinor);
+        }
+
+        // 本机接口和绑定端口已知，不等待外部网络报告完成才发布本地候选。
+        // LAN-only 连续同类变化会写入相同报告值，报告 watcher 不会再次通知。
+        #[cfg(not(wasm_browser))]
+        {
+            let (report, _reason) = self.sock.net_report.get();
+            self.update_direct_addresses(report.as_ref());
         }
 
         if self.has_usable_network() {

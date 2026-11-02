@@ -488,6 +488,9 @@ impl RemoteStateActor {
         if self.connections.is_empty() {
             trace!("last connection closed - clearing selected_path");
             self.state.selected_path = None;
+        } else {
+            // 被移除的连接可能持有所选路径；其余连接仍存活时也必须重新选择。
+            self.select_path();
         }
     }
 
@@ -802,7 +805,7 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        let targets = if let Some(addr) = self.selected_path.as_ref() {
+        let mut targets = if let Some(addr) = self.selected_path.as_ref() {
             trace!(?addr, "sending datagram to selected path");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
@@ -818,31 +821,35 @@ impl State {
                 warn!("Cannot send datagrams: No paths to remote endpoint known");
             }
 
-            let mut targets = SmallVec::new();
-            for addr in self.paths.addrs() {
-                // We never want to send to our local addresses.
-                // The local address set is updated in the main loop so we can use `peek` here.
-                if let transports::Addr::Ip(sockaddr) = addr
-                    && self
-                        .local_direct_addrs
-                        .peek()
-                        .iter()
-                        .any(|a| a.addr == *sockaddr)
-                {
-                    trace!(%sockaddr, "not sending datagram to our own address");
+            SmallVec::new()
+        };
+        // Initial 拨号保留所选路径优先，同时使用本次已知候选；旧选择不能屏蔽新地址。
+        let selected_target = targets.first().cloned();
+        for addr in self.paths.addrs() {
+            // We never want to send to our local addresses.
+            // The local address set is updated in the main loop so we can use `peek` here.
+            if let transports::Addr::Ip(sockaddr) = addr
+                && self
+                    .local_direct_addrs
+                    .peek()
+                    .iter()
+                    .any(|a| a.addr == *sockaddr)
+            {
+                trace!(%sockaddr, "not sending datagram to our own address");
 
-                // TODO(Frando): We might want to include a local IP here in the future, if we confidently
-                // know that it is the correct one.
-                // See https://github.com/n0-computer/iroh/issues/4280.
-                } else {
-                    targets.push(transports::FourTuple::from_remote(addr.clone()));
+            // TODO(Frando): We might want to include a local IP here in the future, if we confidently
+            // know that it is the correct one.
+            // See https://github.com/n0-computer/iroh/issues/4280.
+            } else {
+                let target = transports::FourTuple::from_remote(addr.clone());
+                if selected_target.as_ref() != Some(&target) {
+                    targets.push(target);
                 }
             }
-            // This message is received *before* a connection is added.  So we do
-            // not yet have a connection to holepunch.  Instead we trigger
-            // holepunching when AddConnection is received.
-            targets
-        };
+        }
+        // This message is received *before* a connection is added.  So we do
+        // not yet have a connection to holepunch.  Instead we trigger
+        // holepunching when AddConnection is received.
 
         if targets.is_empty() {
             return;

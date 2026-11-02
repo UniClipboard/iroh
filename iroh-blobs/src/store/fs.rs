@@ -71,7 +71,10 @@ use std::{
     num::NonZeroU64,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use bao_tree::{
@@ -140,6 +143,8 @@ mod import;
 mod lifecycle;
 mod meta;
 pub mod options;
+#[cfg(test)]
+mod persistence_tests;
 pub(crate) mod util;
 use entry_state::EntryState;
 use import::{import_byte_stream, import_bytes, import_path, ImportEntryMsg};
@@ -211,6 +216,8 @@ struct TaskContext {
     pub protect: ProtectHandle,
     // 长期观察订阅在关闭时结束；导入／导出仍由原任务完整结算。
     pub shutting_down: watch::Sender<bool>,
+    // A completed teardown must not acknowledge a failed partial flush.
+    pub persistence_failed: AtomicBool,
 }
 
 impl TaskContext {
@@ -237,7 +244,13 @@ impl entity_manager::Params for EmParams {
         cause: entity_manager::ShutdownCause,
     ) {
         trace!("persist {:?} due to {cause:?}", state.id);
-        state.persist().await;
+        if let Err(cause) = state.persist().await {
+            state
+                .global
+                .persistence_failed
+                .store(true, Ordering::Relaxed);
+            error!(error_kind = ?cause.kind(), "failed to persist partial blob");
+        }
     }
 }
 
@@ -703,7 +716,10 @@ impl Actor {
             return (shutdowns, false);
         }
         match self.database.await {
-            Ok(Ok(())) => (shutdowns, !task_failed),
+            Ok(Ok(())) => (
+                shutdowns,
+                !task_failed && !self.context.persistence_failed.load(Ordering::Relaxed),
+            ),
             Ok(Err(error)) => {
                 error!(%error, "metadata actor failed during shutdown");
                 (shutdowns, false)
@@ -746,6 +762,7 @@ impl Actor {
             internal_cmd_tx: fs_commands_tx,
             protect,
             shutting_down: watch::channel(false).0,
+            persistence_failed: AtomicBool::new(false),
         });
         let database = tokio::spawn(db_actor.run());
         Ok(Self {
@@ -932,7 +949,7 @@ trait EntityApi {
     /// Export the entry to a local file.
     async fn export_path(&self, cmd: ExportPathMsg);
     /// Persist the entry at the end of its lifecycle.
-    async fn persist(&self);
+    async fn persist(&self) -> io::Result<()>;
 }
 
 /// A more opinionated API that can be used as a helper to save implementation
@@ -1042,30 +1059,15 @@ impl EntityApi for HashContext {
     }
 
     #[instrument(skip_all, fields(hash = %self.id.fmt_short()))]
-    async fn persist(&self) {
-        self.state.send_if_modified(|guard| {
-            let hash = &self.id;
-            // Only Partial states have anything to flush. Calling `take()` on
-            // a non-Partial state leaves the handle Poisoned for the rest of
-            // its lifetime, which later causes `bitfield()` to panic.
-            if !matches!(&*guard, BaoFileStorage::Partial(_)) {
-                return false;
-            }
-            let BaoFileStorage::Partial(fs) = guard.take() else {
-                unreachable!("variant checked above");
-            };
-            let path = self.global.options.path.bitfield_path(hash);
-            trace!("writing bitfield for hash {} to {}", hash, path.display());
-            if let Err(cause) = fs.sync_all(&path) {
-                error!(
-                    "failed to write bitfield for {} at {}: {:?}",
-                    hash,
-                    path.display(),
-                    cause
-                );
-            }
-            false
-        });
+    async fn persist(&self) -> io::Result<()> {
+        let state = self.state.borrow();
+        let BaoFileStorage::Partial(fs) = &*state else {
+            return Ok(());
+        };
+        // Flushing only borrows the files. Keep the live state valid on both
+        // success and failure; entity retirement owns releasing its handles.
+        let path = self.global.options.path.bitfield_path(&self.id);
+        fs.sync_all(&path)
     }
 }
 
@@ -1596,7 +1598,7 @@ pub mod tests {
         round_up_to_chunks_groups(ranges, IROH_BLOCK_SIZE)
     }
 
-    fn create_n0_bao_full(
+    pub(super) fn create_n0_bao_full(
         data: &[u8],
         ranges: &ChunkRanges,
     ) -> n0_error::Result<(Hash, ChunkRanges, Vec<u8>)> {
