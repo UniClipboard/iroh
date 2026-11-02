@@ -28,13 +28,14 @@
 use std::net::SocketAddr;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    future::Future,
+    future::{Future, pending},
     net::IpAddr,
     pin::{Pin, pin},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::SystemTime,
 };
 
 use backon::{Backoff, BackoffBuilder, ExponentialBuilder};
@@ -55,7 +56,7 @@ use n0_future::{
 };
 use n0_watcher::Watchable;
 use netwatch::interfaces;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, debug, error, event, info, info_span, instrument, trace, warn};
 use url::Url;
@@ -140,6 +141,8 @@ struct ActiveRelayActor {
     url: RelayUrl,
     /// Builder which can repeatedly build a relay client.
     relay_client_builder: relay::client::ClientBuilder,
+    connection_opts: RelayConnectionOptions,
+    relay_map: Option<RelayMap>,
     /// Whether or not this is the home relay server.
     ///
     /// The home relay server needs to maintain it's connection to the relay server, even if
@@ -196,13 +199,14 @@ struct ActiveRelayActorOptions {
     relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
     relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
     connection_opts: RelayConnectionOptions,
+    relay_map: Option<RelayMap>,
     stop_token: CancellationToken,
     metrics: Arc<SocketMetrics>,
     my_relay: HomeRelayWatch,
 }
 
 /// Configuration needed to create a connection to a relay server.
-#[derive(Debug, Clone)]
+#[derive(Clone, derive_more::Debug)]
 struct RelayConnectionOptions {
     secret_key: SecretKey,
     #[cfg(not(wasm_browser))]
@@ -210,6 +214,7 @@ struct RelayConnectionOptions {
     proxy_url: Option<Url>,
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
+    #[debug("[REDACTED]")]
     auth_token: Option<String>,
 }
 
@@ -259,6 +264,15 @@ enum DialError {
     Connect { source: ConnectError },
 }
 
+async fn wait_for_config_change(changes: &mut Option<watch::Receiver<()>>) {
+    match changes {
+        Some(changes) => {
+            changes.changed().await.ok();
+        }
+        None => pending::<()>().await,
+    }
+}
+
 impl ActiveRelayActor {
     fn new(opts: ActiveRelayActorOptions) -> Self {
         let ActiveRelayActorOptions {
@@ -268,11 +282,14 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             relay_datagrams_recv,
             connection_opts,
+            relay_map,
             stop_token,
             metrics,
             my_relay,
         } = opts;
-        let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts);
+        let relay_client_builder = Self::create_relay_builder(url.clone(), connection_opts.clone());
+        let mut connection_opts = connection_opts;
+        connection_opts.auth_token = None;
         ActiveRelayActor {
             prio_inbox,
             inbox,
@@ -280,6 +297,8 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             url,
             relay_client_builder,
+            connection_opts,
+            relay_map,
             is_home_relay: false,
             inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
             stop_token,
@@ -326,7 +345,59 @@ impl ActiveRelayActor {
     async fn run(mut self) {
         let mut backoff = Self::build_backoff();
 
-        while let Err(err) = self.run_once().await {
+        let relay_map = self.relay_map.take();
+        let mut changes = relay_map.as_ref().map(RelayMap::watch_changes);
+        let mut was_configured = relay_map
+            .as_ref()
+            .is_some_and(|map| map.contains(&self.url));
+        loop {
+            let current = relay_map.as_ref().and_then(|map| map.get(&self.url));
+            was_configured |= current.is_some();
+            if was_configured && current.is_none() {
+                self.my_relay.set_status(
+                    &self.url,
+                    RelayConnectionState::Disconnected { last_failure: None },
+                );
+                break;
+            }
+            if let Some(config) = &current {
+                if config
+                    .auth_token_expires_at
+                    .is_some_and(|expiry| SystemTime::now() >= expiry)
+                {
+                    self.my_relay.set_status(
+                        &self.url,
+                        RelayConnectionState::Disconnected { last_failure: None },
+                    );
+                    tokio::select! {
+                        _ = self.stop_token.cancelled() => break,
+                        _ = wait_for_config_change(&mut changes) => continue,
+                    }
+                }
+                let mut options = self.connection_opts.clone();
+                options.auth_token = config.auth_token.clone();
+                self.relay_client_builder = Self::create_relay_builder(self.url.clone(), options);
+            }
+            let url = self.url.clone();
+            let result = {
+                let attempt = self.run_once();
+                tokio::pin!(attempt);
+                loop {
+                    tokio::select! {
+                        result = &mut attempt => break Some(result),
+                        _ = wait_for_config_change(&mut changes) => {
+                            if relay_map.as_ref().and_then(|map| map.get(&url)) != current { break None; }
+                        }
+                    }
+                }
+            };
+            let Some(result) = result else {
+                backoff = Self::build_backoff();
+                continue;
+            };
+            let Err(err) = result else {
+                break;
+            };
             debug!("{err:#}");
             let was_established = matches!(err, RelayConnectionError::Established { .. });
             let last_failure = Some(Arc::new(RelayConnectionFailure::new(err)));
@@ -1229,7 +1300,10 @@ impl RelayActor {
         }
     }
 
-    async fn on_network_change(&mut self, report: Report) {
+    async fn on_network_change(&mut self, mut report: Report) {
+        report.preferred_relay = report
+            .preferred_relay
+            .filter(|url| self.config.relay_map.contains(url));
         let prev = self.config.my_relay.get();
         let prev_url = prev.as_ref().map(RelayStatus::url);
         if report.preferred_relay.as_ref() == prev_url {
@@ -1368,6 +1442,7 @@ impl RelayActor {
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
+            relay_map: Some(self.config.relay_map.clone()),
             stop_token: self.cancel_token.child_token(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
@@ -1439,7 +1514,11 @@ impl RelayActor {
 
         // Make sure home relay exists
         if let Some(status) = self.config.my_relay.get() {
-            self.active_relay_handle(status.url().clone());
+            if self.config.relay_map.contains(status.url()) {
+                self.active_relay_handle(status.url().clone());
+            } else {
+                self.config.my_relay.clear();
+            }
         }
         self.log_active_relay();
     }
@@ -1581,6 +1660,7 @@ mod tests {
             inbox: inbox_rx,
             relay_datagrams_send,
             relay_datagrams_recv,
+            relay_map: None,
             connection_opts: RelayConnectionOptions {
                 secret_key,
                 dns_resolver: DnsResolver::new(),
@@ -1946,6 +2026,7 @@ mod tests {
             inbox: inbox_rx,
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: recv_datagram_tx,
+            relay_map: None,
             connection_opts: RelayConnectionOptions {
                 secret_key,
                 dns_resolver: DnsResolver::new(),
