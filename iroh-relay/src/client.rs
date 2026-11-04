@@ -156,6 +156,7 @@ pub struct ClientBuilder {
     ///
     /// Sent as an `Authorization: Bearer` header on native targets and as
     /// a `?token=` query parameter under Wasm. See [`ClientBuilder::auth_token`].
+    #[debug("[REDACTED]")]
     auth_token: Option<String>,
     #[cfg(not(wasm_browser))]
     dns_resolver: DnsResolver,

@@ -3,11 +3,13 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, RwLock},
+    sync::{Arc, PoisonError, RwLock},
+    time::SystemTime,
 };
 
 use iroh_base::{RelayUrl, RelayUrlParseError};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::defaults::DEFAULT_RELAY_QUIC_PORT;
 
@@ -30,6 +32,7 @@ use crate::defaults::DEFAULT_RELAY_QUIC_PORT;
 pub struct RelayMap {
     /// A map of the different relay IDs to the [`RelayConfig`] information
     relays: Arc<RwLock<BTreeMap<RelayUrl, Arc<RelayConfig>>>>,
+    changes: Arc<watch::Sender<()>>,
 }
 
 impl PartialEq for RelayMap {
@@ -47,6 +50,7 @@ impl RelayMap {
     pub fn empty() -> Self {
         Self {
             relays: Default::default(),
+            changes: Arc::new(watch::channel(()).0),
         }
     }
 
@@ -73,7 +77,13 @@ impl RelayMap {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             relays: Arc::new(RwLock::new(relays)),
+            changes: Arc::new(watch::channel(()).0),
         })
+    }
+
+    /// 观察配置变化，不保留旧凭据。
+    pub fn watch_changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 
     /// Returns the URLs of all servers in this relay map.
@@ -130,12 +140,24 @@ impl RelayMap {
 
     /// Inserts a new relay into the relay map.
     pub fn insert(&self, url: RelayUrl, endpoint: Arc<RelayConfig>) -> Option<Arc<RelayConfig>> {
-        self.relays.write().expect("poisoned").insert(url, endpoint)
+        let previous = self
+            .relays
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url, endpoint);
+        self.changes.send_replace(());
+        previous
     }
 
     /// Removes an existing relay by its URL.
     pub fn remove(&self, url: &RelayUrl) -> Option<Arc<RelayConfig>> {
-        self.relays.write().expect("poisoned").remove(url)
+        let previous = self
+            .relays
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(url);
+        self.changes.send_replace(());
+        previous
     }
 
     /// Extends this `RelayMap` with another one.
@@ -143,6 +165,7 @@ impl RelayMap {
         let mut a = self.relays.write().expect("poisoned");
         let b = other.relays.read().expect("poisoned");
         a.extend(b.iter().map(|(a, b)| (a.clone(), b.clone())));
+        self.changes.send_replace(());
     }
 
     /// Sets an authorization token for all relays configured in this relay map.
@@ -156,6 +179,7 @@ impl RelayMap {
         for config in self.relays.write().expect("poisoned").values_mut() {
             *config = Arc::new(config.as_ref().clone().with_auth_token(auth_token.clone()));
         }
+        self.changes.send_replace(());
         self
     }
 }
@@ -174,6 +198,7 @@ impl FromIterator<Arc<RelayConfig>> for RelayMap {
                     .map(|config| (config.url.clone(), config))
                     .collect(),
             )),
+            changes: Arc::new(watch::channel(()).0),
         }
     }
 }
@@ -188,6 +213,7 @@ impl From<RelayUrl> for RelayMap {
             relays: Arc::new(RwLock::new(
                 [(value.clone(), Arc::new(value.into()))].into(),
             )),
+            changes: Arc::new(watch::channel(()).0),
         }
     }
 }
@@ -196,6 +222,7 @@ impl From<RelayConfig> for RelayMap {
     fn from(value: RelayConfig) -> Self {
         Self {
             relays: Arc::new(RwLock::new([(value.url.clone(), Arc::new(value))].into())),
+            changes: Arc::new(watch::channel(()).0),
         }
     }
 }
@@ -212,6 +239,7 @@ impl FromIterator<RelayUrl> for RelayMap {
                     .map(|url| (url.clone(), Arc::new(url.into())))
                     .collect(),
             )),
+            changes: Arc::new(watch::channel(()).0),
         }
     }
 }
@@ -227,7 +255,7 @@ impl fmt::Display for RelayMap {
 /// Includes the Url where it can be dialed.
 // Please note that this is documented in the `iroh.computer` repository under
 // `src/app/docs/reference/config/page.mdx`.  Any changes to this need to be updated there.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[non_exhaustive]
 pub struct RelayConfig {
     /// The [`RelayUrl`] where this relay server can be dialed.
@@ -243,6 +271,22 @@ pub struct RelayConfig {
     /// Set via [`RelayConfig::with_auth_token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
+    /// 凭据的绝对过期时间；未设置时保留静态令牌行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_expires_at: Option<SystemTime>,
+}
+
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("url", &self.url)
+            .field("quic", &self.quic)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl RelayConfig {
@@ -252,7 +296,14 @@ impl RelayConfig {
             url,
             quic,
             auth_token: None,
+            auth_token_expires_at: None,
         }
+    }
+
+    /// 限制每次重连使用凭据的有效期，包含系统休眠后的重连。
+    pub fn with_auth_token_expiry(mut self, expires_at: SystemTime) -> Self {
+        self.auth_token_expires_at = Some(expires_at);
+        self
     }
 
     /// Sets an authorization token for this relay.
@@ -275,6 +326,7 @@ impl From<RelayUrl> for RelayConfig {
             url: value,
             quic: quic_config(),
             auth_token: None,
+            auth_token_expires_at: None,
         }
     }
 }

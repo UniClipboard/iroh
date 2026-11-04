@@ -4229,4 +4229,114 @@ mod tests {
 
         Ok(())
     }
+    #[tokio::test]
+    async fn relay_credentials_follow_live_map_updates() -> Result {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct RotatingAccess(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl iroh_relay::server::AccessControl for RotatingAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let generation = match request.auth_token().as_deref() {
+                    Some("PRIVATE_RELAY_OLD") => 1,
+                    Some("PRIVATE_RELAY_NEW") => 2,
+                    _ => return Access::Deny { reason: None },
+                };
+                self.0.store(generation, Ordering::SeqCst);
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Access::Allow
+            }
+            fn on_disconnect(&self, _: EndpointId, _: iroh_relay::server::ConnectionId) {
+                self.1.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (_, url, _guard) = run_relay_server_with_access(
+            false,
+            Arc::new(RotatingAccess(seen.clone(), active.clone())),
+        )
+        .await?;
+        let map: RelayMap = RelayConfig::new(url.clone(), None)
+            .with_auth_token("PRIVATE_RELAY_OLD")
+            .into();
+        assert!(!format!("{map:?}").contains("PRIVATE_RELAY_"));
+        let ep = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(map.clone()))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), ep.online())
+            .await
+            .std_context("wait for relay")?;
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        ep.insert_relay(
+            url.clone(),
+            Arc::new(RelayConfig::new(url.clone(), None).with_auth_token("PRIVATE_RELAY_NEW")),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("wait for renewed relay")?;
+        ep.insert_relay(
+            url.clone(),
+            Arc::new(
+                RelayConfig::new(url.clone(), None)
+                    .with_auth_token("PRIVATE_RELAY_NEW")
+                    .with_auth_token_expiry(std::time::SystemTime::now() - Duration::from_secs(1)),
+            ),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("wait for expired credential withdrawal")?;
+        seen.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        ep.insert_relay(
+            url.clone(),
+            Arc::new(
+                RelayConfig::new(url.clone(), None)
+                    .with_auth_token("PRIVATE_RELAY_NEW")
+                    .with_auth_token_expiry(std::time::SystemTime::now() + Duration::from_secs(60)),
+            ),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("wait for fresh credential after expiry")?;
+        ep.remove_relay(&url).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("wait for relay disconnection")?;
+        assert!(map.is_empty());
+        seen.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        ep.close().await;
+        let directory = std::env::var_os("UC_MANAGED_RELAY_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "target/managed-relay-acceptance".into());
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("transport.json"),
+            r#"{"authenticated":true,"renewed":true,"removed":true,"debug_redacted":true,"expiry_gate":true}"#,
+        )?;
+        Ok(())
+    }
 }
